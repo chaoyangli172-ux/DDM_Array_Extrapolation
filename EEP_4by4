@@ -1,0 +1,194 @@
+%% ========================================================================
+%  eep_gain_AR_pattern_v2.m
+%  Added based on v1: Automatically calculate port excitation phases for 
+%  any scan angle (theta_scan, phi_scan) according to the true array 
+%  geometry (16 dual-port elements / 32 ports), and then synthesize the 
+%  Gain and Axial Ratio (AR) patterns using the Embedded Element Pattern (EEP).
+%
+%  Array geometry is based on the user's description (4x4 layout, composed 
+%  of 2x2 sequentially rotated subarrays duplicated by 2x2 translation):
+%    - Element positions: x(r,c) = (r-1)*11.8 + (mod(c,2)==0)*5.9   [mm]
+%                         y(r,c) = (c-1)*10.2                       [mm]
+%      r=1..4 along X ("bottom" in diagram), c=1..4 along Y ("right" in diagram)
+%    - Sequential rotation (SR) angle: 0/90/180/270 (deg) within each 2x2 
+%      subarray. The four subarrays repeat the identical pattern.
+%    - Ports: Element k (1..16) corresponds to ports (2k-1, 2k); 
+%      Odd ports = LHCP, Even ports = RHCP.
+%
+%  !! Assumptions Requiring Verification !!
+%    1) Whether the rotation step increment is exactly 90° (ROT_STEP_DEG).
+%    2) The sequential rotation phase sign is hard-coded as confirmed: 
+%       RHCP = +rotation_deg, LHCP = -rotation_deg.
+%% ========================================================================
+clear; clc; close all;
+
+%% =================== Array Geometry (16 Elements / 32 Ports) =============
+dx = 11.8;                % mm, spacing along X (row)
+dy = 10.2;                % mm, spacing along Y (column)
+x_offset_even_col = 5.9;  % mm, additional x-coordinate offset for even columns (c=2,4)
+ROT_STEP_DEG   = 90;      % <-- Assumption 1: SR phase step. Modify here if not 90° in practice.
+SR_SIGN_RHCP   = 1;       % Confirmed: LHCP ports (even ports) phase_SR = +rotation_deg (i.e., 0/90/180/270)
+                          %            RHCP ports (odd ports) phase_SR = -rotation_deg (i.e., 0/-90/-180/-270)
+
+nElem = 16;
+elem_rc = zeros(nElem, 2);   % [r, c]
+k = 0;
+for c = 1:4
+    for r = 1:4
+        k = k + 1;
+        elem_rc(k,:) = [r, c];
+    end
+end
+
+% The generation order above (outer c, inner r) might not match the physical 
+% numbering sequence from 1 to 16. The explicit table below exactly matches 
+% the element 1~16 mapping derived to avoid sequence confusion. This serves 
+% as the sole "authoritative" geometry definition in this script; all others 
+% are derived from it.
+elem_rc = [ ...
+    1 1;   % k=1  (ports 1,2)
+    2 1;   % k=2  (ports 3,4)
+    2 2;   % k=3  (ports 5,6)
+    1 2;   % k=4  (ports 7,8)
+    3 1;   % k=5  (ports 9,10)
+    4 1;   % k=6  (ports 11,12)
+    4 2;   % k=7  (ports 13,14)
+    3 2;   % k=8  (ports 15,16)
+    1 3;   % k=9  (ports 17,18)
+    2 3;   % k=10 (ports 19,20)
+    2 4;   % k=11 (ports 21,22)
+    1 4;   % k=12 (ports 23,24)
+    3 3;   % k=13 (ports 25,26)
+    4 3;   % k=14 (ports 27,28)
+    4 4;   % k=15 (ports 29,30)
+    3 4];  % k=16 (ports 31,32)
+
+x_elem = (elem_rc(:,1)-1)*dx + (mod(elem_rc(:,2),2)==0)*x_offset_even_col;   % mm
+y_elem = (elem_rc(:,2)-1)*dy;                                                % mm
+
+% Internal rotation angle of the subarray: Local "slots" 1/2/3/4 correspond to 
+% (r-odd, c-odd) / (r-even, c-odd) / (r-even, c-even) / (r-odd, c-even)
+r_odd = mod(elem_rc(:,1),2)==1;
+c_odd = mod(elem_rc(:,2),2)==1;
+rot_deg = zeros(nElem,1);
+rot_deg( r_odd &  c_odd) = 0*ROT_STEP_DEG;
+rot_deg(~r_odd &  c_odd) = 1*ROT_STEP_DEG;
+rot_deg(~r_odd & ~c_odd) = 2*ROT_STEP_DEG;
+rot_deg( r_odd & ~c_odd) = 3*ROT_STEP_DEG;
+
+port_LHCP = 2*(1:nElem)' - 1;   % Odd ports
+port_RHCP = 2*(1:nElem)';       % Even ports
+
+fprintf('Array Geometry Table (mm, deg):\n');
+disp(table((1:nElem)', x_elem, y_elem, rot_deg, port_LHCP, port_RHCP, ...
+    'VariableNames', {'Elem','x_mm','y_mm','rot_deg','port_LHCP','port_RHCP'}));
+
+%% =================== User Inputs =========================================
+N          = 32;
+f_target   = 14.5;       % GHz, used to match EEP frequency and calculate k0 for steering phase
+theta_scan = 0;          % deg
+phi_scan   = 0;          % deg
+pol_mode   = 'RHCP';     % 'RHCP' or 'LHCP' — In practice, only one set of 16 ports is excited
+rEpattern  = 'rE Plot %d.csv';
+
+%% =================== Calculate 32-Port Excitation (Amplitude & Phase) ====
+c0 = 299792458;             % m/s
+f_Hz = f_target * 1e9;
+k0 = 2*pi*f_Hz/c0;
+x_m = x_elem/1000;  y_m = y_elem/1000;
+
+% Standard array scanning phase (aligns the wavefront in phase at the (theta_scan, phi_scan) direction)
+phase_scan = -k0*( x_m*sind(theta_scan)*cosd(phi_scan) + y_m*sind(theta_scan)*sind(phi_scan) );  % rad
+
+P_port = zeros(N,1);
+phase_port = zeros(N,1);
+
+switch upper(pol_mode)
+    case 'LHCP'
+        active_ports = port_RHCP;
+        phase_SR = SR_SIGN_RHCP * deg2rad(rot_deg);
+    case 'RHCP'
+        active_ports = port_LHCP;
+        phase_SR = -SR_SIGN_RHCP * deg2rad(rot_deg);
+    otherwise
+        error('pol_mode must be either ''RHCP'' or ''LHCP''');
+end
+
+P_port(active_ports)     = 1;                          % Uniform amplitude of 1W, modify here if tapering is required
+phase_port(active_ports) = phase_SR + phase_scan;      % Inherent sequential rotation phase + scanning phase
+a = sqrt(P_port) .* exp(1j*phase_port);
+Pinc = real(a'*a);
+
+%% =================== Read EEP and Synthesize Pattern (Same Logic as v1) ==
+fprintf('\nLoading %d EEP files, target f = %.3f GHz, scan=(%g,%g), pol=%s ...\n', ...
+    N, f_target, theta_scan, phi_scan, pol_mode);
+
+%% =================== Load EEP Database ===================================
+load('EEP_database.mat',...
+    'VR_all',...
+    'VL_all',...
+    'theta_grid',...
+    'phi_grid');
+
+fprintf('EEP database loaded: %d ports, %d x %d grid\n',...
+    size(VR_all,3),...
+    length(theta_grid),...
+    length(phi_grid));
+fprintf('All %d EEP files loaded. Grid: %d theta x %d phi\n', N, numel(theta_grid), numel(phi_grid));
+
+a_r = reshape(a, 1, 1, N);
+E_R = sum(VR_all .* a_r, 3);
+E_L = sum(VL_all .* a_r, 3);
+
+eta0 = 376.730313668;
+EIRP_factor = 2*pi/eta0;
+EIRP_R = abs(E_R).^2 * EIRP_factor;
+EIRP_L = abs(E_L).^2 * EIRP_factor;
+
+G_R_dBi   = 10*log10(EIRP_R / Pinc);
+G_L_dBi   = 10*log10(EIRP_L / Pinc);
+G_tot_dBi = 10*log10((EIRP_R + EIRP_L) / Pinc);
+
+AR_lin = (abs(E_R) + abs(E_L)) ./ abs(abs(E_R) - abs(E_L));
+AR_dB  = 20*log10(AR_lin);
+AR_dB(~isfinite(AR_dB)) = NaN;
+
+%% =================== Results Summary =====================================
+if strcmpi(pol_mode,'RHCP')
+    G_copol_dBi = G_R_dBi;
+else
+    G_copol_dBi = G_L_dBi;
+end
+
+[~, idxMax] = max(G_copol_dBi(:));
+[iTh, iPh] = ind2sub(size(G_copol_dBi), idxMax);
+
+fprintf('\nPeak %s Realized Gain = %.2f dBi, located at theta=%g°, phi=%g°\n', ...
+    pol_mode, G_copol_dBi(idxMax), theta_grid(iTh), phi_grid(iPh));
+fprintf('At the designed scan direction (theta=%g°, phi=%g°), Gain = %.2f dBi, AR = %.2f dB\n', ...
+    theta_scan, phi_scan, ...
+    interp2(phi_grid, theta_grid, G_copol_dBi, phi_scan, theta_scan), ...
+    interp2(phi_grid, theta_grid, AR_dB,      phi_scan, theta_scan));
+
+%% =================== Plotting ============================================
+% Find the phi-cut corresponding to the scanning plane
+[~, ip] = min(abs(phi_grid - phi_scan));
+
+% ================= Gain Curve =================
+figure('Position', [100 100 700 450]);
+plot(theta_grid, G_copol_dBi(:,ip), 'LineWidth', 1.3);
+xlabel('Theta [deg]');
+ylabel('Realized Gain [dBi]');
+title(sprintf('%s Realized Gain @ %.2f GHz, Phi=%g°', ...
+    pol_mode, f_target, phi_grid(ip)));
+grid on;
+
+% ================= Axial Ratio (AR) Curve =================
+figure('Position', [850 100 700 450]);
+plot(theta_grid, AR_dB(:,ip), 'LineWidth', 1.3);
+xlabel('Theta [deg]');
+ylabel('Axial Ratio [dB]');
+title(sprintf('Axial Ratio @ %.2f GHz, Phi=%g°', ...
+    f_target, phi_grid(ip)));
+ylim([0 20]);
+grid on;

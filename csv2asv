@@ -1,0 +1,82 @@
+% This code's primary aim is to transfer CSV files into MATLAB ASV files to reduce running time
+clear; clc;
+
+N = 32;
+f_target = 14.5;
+rEpattern = 'rE Plot %d.csv';
+
+VR_all = [];
+VL_all = [];
+
+theta_grid = [];
+phi_grid = [];
+
+for i = 1:N
+
+    fprintf('Reading port %d/%d...\n',i,N);
+
+    fname = sprintf(rEpattern,i);
+
+    data = readmatrix(fname,'NumHeaderLines',1);
+
+    % find the desired frequency point
+    freqs_here = unique(data(:,1));
+    [~,fi] = min(abs(freqs_here-f_target));
+    f_sel = freqs_here(fi);
+
+    mask = abs(data(:,1)-f_sel)<1e-9;
+    d=data(mask,:);
+
+
+    phi_vals=d(:,2);
+    theta_vals=d(:,3);
+
+    [tg,~,tIdx]=unique(theta_vals);
+    [pg,~,pIdx]=unique(phi_vals);
+
+
+    if i==1
+
+        theta_grid=tg;
+        phi_grid=pg;
+
+        nth=numel(tg);
+        nph=numel(pg);
+
+        VR_all=zeros(nth,nph,N,'single');
+        VL_all=zeros(nth,nph,N,'single');
+
+    else
+
+        assert(isequal(tg,theta_grid));
+        assert(isequal(pg,phi_grid));
+
+    end
+
+
+    % Electric field
+    Ephi = accumarray([tIdx,pIdx],...
+        d(:,4)+1j*d(:,5),...
+        [nth nph]);
+
+    Etheta = accumarray([tIdx,pIdx],...
+        d(:,6)+1j*d(:,7),...
+        [nth nph]);
+
+
+    % RHCP/LHCP
+    VR_all(:,:,i)=single((Etheta+1j*Ephi)/sqrt(2));
+    VL_all(:,:,i)=single((Etheta-1j*Ephi)/sqrt(2));
+
+end
+
+
+save('EEP_database.mat',...
+    'VR_all',...
+    'VL_all',...
+    'theta_grid',...
+    'phi_grid',...
+    '-v7.3');
+
+
+fprintf('EEP database saved.\n');

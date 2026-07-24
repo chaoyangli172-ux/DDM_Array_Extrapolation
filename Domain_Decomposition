@@ -1,0 +1,239 @@
+%% ========================================================================
+%  ddm_1024_array_pattern_v2.m
+%  Synthesizes the Gain and Axial Ratio (AR) patterns for a 32x32 = 1024 
+%  element large array using the Embedded Element Pattern (EEP) database 
+%  of a 4x4 subarray (16 elements/32 ports). The synthesis utilizes the 
+%  Domain Decomposition Method (DDM), categorizing and multiplexing 
+%  representative elements by Corner (C), Edge (E), and Interior (I).
+%
+%  (Employs the same Representative Element Method as the initial 
+%   ddm_1024_array_pattern.m, but corrects the port polarity mapping based 
+%   on confirmed conventions:
+%     Odd ports = RHCP, Even ports = LHCP)
+%
+%  The C/E/I classification mapping and 4x4 subarray geometry remain 
+%  completely identical to previous versions and are not reiterated here.
+%% ========================================================================
+clear; clc; close all;
+
+%% =================== 4x4 Subarray Geometry (Authoritative Definition) ====
+dx = 11.8;                % mm, inter-element spacing along x-axis
+dy = 10.2;                % mm, inter-element spacing along y-axis
+x_offset_even_col = 5.9;  % mm, x-coordinate offset for even columns
+ROT_STEP_DEG = 90;        % Sequential rotation phase step
+SR_SIGN_RHCP = 1;         % Sequential rotation sign for RHCP
+nElem = 16;               % Number of elements in subarray
+
+elem_rc = [ ...
+    1 1;  2 1;  2 2;  1 2; ...
+    3 1;  4 1;  4 2;  3 2; ...
+    1 3;  2 3;  2 4;  1 4; ...
+    3 3;  4 3;  4 4;  3 4];
+
+x_elem = (elem_rc(:,1)-1)*dx + (mod(elem_rc(:,2),2)==0)*x_offset_even_col;
+y_elem = (elem_rc(:,2)-1)*dy;
+
+r_odd = mod(elem_rc(:,1),2)==1;
+c_odd = mod(elem_rc(:,2),2)==1;
+
+rot_deg = zeros(nElem,1);
+rot_deg( r_odd &  c_odd) = 0*ROT_STEP_DEG;
+rot_deg(~r_odd &  c_odd) = 1*ROT_STEP_DEG;
+rot_deg(~r_odd & ~c_odd) = 2*ROT_STEP_DEG;
+rot_deg( r_odd & ~c_odd) = 3*ROT_STEP_DEG;
+
+port_odd  = 2*(1:nElem)' - 1;   % Odd ports = RHCP (Confirmed)
+port_even = 2*(1:nElem)';       % Even ports = LHCP
+
+%% =================== User Inputs =========================================
+N_SIDE     = 8;         % Number of elements per side of the large array, 32x32 = 1024 elements
+f_target   = 14.5;      % Operating frequency in GHz
+theta_scan = 0;         % Scan angle theta in degrees
+phi_scan   = 0;         % Scan angle phi in degrees
+pol_mode   = 'RHCP';    % Polarization mode: 'RHCP' (Odd ports) or 'LHCP' (Even ports)
+
+%% =================== Large Array Geometry (32x32) ========================
+[R, C] = ndgrid(1:N_SIDE, 1:N_SIDE);
+x_big = (R-1)*dx + (mod(C,2)==0)*x_offset_even_col;
+y_big = (C-1)*dy;
+
+r_odd_b = mod(R,2)==1;
+c_odd_b = mod(C,2)==1;
+rot_big = zeros(N_SIDE);
+rot_big( r_odd_b &  c_odd_b) = 0*ROT_STEP_DEG;
+rot_big(~r_odd_b &  c_odd_b) = 1*ROT_STEP_DEG;
+rot_big(~r_odd_b & ~c_odd_b) = 2*ROT_STEP_DEG;
+rot_big( r_odd_b & ~c_odd_b) = 3*ROT_STEP_DEG;
+nBig = N_SIDE*N_SIDE;
+
+%% =================== DDM Classification: Corner/Edge/Interior ============
+rep_map = zeros(N_SIDE);
+cls_map = repmat('I', N_SIDE);
+for r = 1:N_SIDE
+    for c = 1:N_SIDE
+        [rep_map(r,c), cls_map(r,c)] = rep_element(r, c, N_SIDE);
+    end
+end
+fprintf('DDM Category Mapping (32x32): C=%d, E=%d, I=%d, Total=%d\n', ...
+    nnz(cls_map=='C'), nnz(cls_map=='E'), nnz(cls_map=='I'), nBig);
+
+%% =================== Calculate 1024-Element Excitation (Amplitude & Phase)
+c0 = 299792458;
+f_Hz = f_target * 1e9;
+k0 = 2*pi*f_Hz/c0;
+x_big_m = x_big/1000;
+y_big_m = y_big/1000;
+
+% Calculate spatial scan phase vector
+phase_scan = -k0*( x_big_m*sind(theta_scan)*cosd(phi_scan) ...
+                 + y_big_m*sind(theta_scan)*sind(phi_scan) );
+
+switch upper(pol_mode)
+    case 'RHCP'
+        use_odd_port = true;
+        sign_SR = -SR_SIGN_RHCP;
+    case 'LHCP'
+        use_odd_port = false;
+        sign_SR = +SR_SIGN_RHCP;
+    otherwise
+        error('pol_mode must be strictly ''RHCP'' or ''LHCP''');
+end
+
+% Apply sequential rotation phase compensation
+phase_SR = sign_SR * deg2rad(rot_big);
+a_big = exp(1j*(phase_SR + phase_scan));
+Pinc  = sum(abs(a_big(:)).^2);
+
+%% =================== Load EEP Database ===================================
+fprintf('Loading EEP database, f = %.3f GHz, scan=(%g,%g), pol=%s ...\n', ...
+    f_target, theta_scan, phi_scan, pol_mode);
+load('EEP_database.mat', 'VR_all', 'VL_all', 'theta_grid', 'phi_grid');
+[nTh, nPh, ~] = size(VR_all);
+fprintf('EEP database loaded: %d ports, %d x %d grid\n', size(VR_all,3), nTh, nPh);
+
+%% =================== DDM Synthesis of Large Array Pattern ================
+[PHI, THETA] = meshgrid(phi_grid, theta_grid);
+ux = sind(THETA).*cosd(PHI);
+uy = sind(THETA).*sind(PHI);
+uxv = ux(:); uyv = uy(:);
+nDir = numel(uxv);
+
+E_R = zeros(nDir,1);
+E_L = zeros(nDir,1);
+
+blockSize = 32;
+for k = 1:nElem
+    members = find(rep_map(:) == k);
+    if isempty(members), continue; end
+    
+    if use_odd_port
+        p = port_odd(k);
+    else
+        p = port_even(k);
+    end
+    
+    dxr = (x_big(members) - x_elem(k))/1000;
+    dyr = (y_big(members) - y_elem(k))/1000;
+    am  = a_big(members);
+    
+    AF = zeros(nDir,1);
+    % Block processing to prevent out-of-memory errors during Array Factor computation
+    for i0 = 1:blockSize:numel(members)
+        ii = i0:min(i0+blockSize-1, numel(members));
+        AF = AF + exp(1j*k0*( uxv*dxr(ii).' + uyv*dyr(ii).' )) * am(ii);
+    end
+    
+    E_R = E_R + AF .* reshape(VR_all(:,:,p), nDir, 1);
+    E_L = E_L + AF .* reshape(VL_all(:,:,p), nDir, 1);
+end
+
+E_R = reshape(E_R, nTh, nPh);
+E_L = reshape(E_L, nTh, nPh);
+
+%% =================== Gain / AR Calculation ===============================
+eta0 = 376.730313668;
+EIRP_factor = 2*pi/eta0;
+EIRP_R = abs(E_R).^2 * EIRP_factor;
+EIRP_L = abs(E_L).^2 * EIRP_factor;
+
+G_R_dBi = 10*log10(EIRP_R / Pinc);
+G_L_dBi = 10*log10(EIRP_L / Pinc);
+
+AR_lin = (abs(E_R) + abs(E_L)) ./ abs(abs(E_R) - abs(E_L));
+AR_dB  = 20*log10(AR_lin);
+AR_dB(~isfinite(AR_dB)) = NaN;
+
+if strcmpi(pol_mode,'RHCP')
+    G_copol_dBi = G_R_dBi;
+else
+    G_copol_dBi = G_L_dBi;
+end
+
+[~, idxMax] = max(G_copol_dBi(:));
+[iTh, iPh] = ind2sub(size(G_copol_dBi), idxMax);
+
+fprintf('\n========== 1024-Element Large Array (DDM) Results ==========\n');
+fprintf('Peak %s Realized Gain = %.2f dBi, located at theta=%g°, phi=%g°\n', ...
+    pol_mode, G_copol_dBi(idxMax), theta_grid(iTh), phi_grid(iPh));
+fprintf('At designed scan direction (theta=%g°, phi=%g°), Gain = %.2f dBi, AR = %.2f dB\n', ...
+    theta_scan, phi_scan, ...
+    interp2(phi_grid, theta_grid, G_copol_dBi, phi_scan, theta_scan), ...
+    interp2(phi_grid, theta_grid, AR_dB,      phi_scan, theta_scan));
+fprintf('(Reference: Ideal array factor gain increment relative to 4x4 subarray 10*log10(1024/16) = %.2f dB)\n', ...
+    10*log10(nBig/nElem));
+
+%% =================== Plotting (Gain and AR Separated, Cartesian Cuts) ====
+[~, ip] = min(abs(phi_grid - phi_scan));
+
+% Plot Realized Gain
+figure('Position', [100 100 700 450]);
+plot(theta_grid, G_copol_dBi(:,ip), 'LineWidth', 1.3);
+xlabel('Theta [deg]'); ylabel('Realized Gain [dBi]');
+title(sprintf('%s Realized Gain @ %.2f GHz, Phi=%g°  (1024-Element DDM)', ...
+    pol_mode, f_target, phi_grid(ip)));
+grid on;
+
+% Plot Axial Ratio
+figure('Position', [850 100 700 450]);
+plot(theta_grid, AR_dB(:,ip), 'LineWidth', 1.3);
+xlabel('Theta [deg]'); ylabel('Axial Ratio [dB]');
+title(sprintf('Axial Ratio @ %.2f GHz, Phi=%g°  (1024-Element DDM)', ...
+    f_target, phi_grid(ip)));
+ylim([0 20]);
+grid on;
+
+%% =================== Local Function: Corner/Edge/Interior Classification =
+function [k, cls] = rep_element(r, c, N)
+    ro = mod(r,2)==1;
+    co = mod(c,2)==1;
+    rEdge = (r==1) || (r==N);
+    cEdge = (c==1) || (c==N);
+    
+    if rEdge && cEdge
+        cls = 'C';  % Corner Element
+        if     ro &&  co, k = 1;
+        elseif ~ro &&  co, k = 6;
+        elseif ~ro && ~co, k = 15;
+        else,                k = 12;
+        end
+    elseif c == 1
+        cls = 'E';  % Edge Element (Left)
+        if ro, k = 5; else, k = 2; end
+    elseif c == N
+        cls = 'E';  % Edge Element (Right)
+        if ro, k = 16; else, k = 11; end
+    elseif r == 1
+        cls = 'E';  % Edge Element (Bottom)
+        if co, k = 9; else, k = 4; end
+    elseif r == N
+        cls = 'E';  % Edge Element (Top)
+        if co, k = 14; else, k = 7; end
+    else
+        cls = 'I';  % Interior Element
+        if     ro &&  co, k = 13;
+        elseif ~ro &&  co, k = 10;
+        elseif ~ro && ~co, k = 3;
+        else,                k = 8;
+        end
+    end
+end
